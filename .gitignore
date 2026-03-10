@@ -1,0 +1,19 @@
+# токены и env
+.env
+*.env
+
+# локальные запускатели
+*.bat
+
+# данные бота
+voice_stats.json
+dota_links.json
+
+# python кеш
+__pycache__/
+*.pyc
+*.pyo
+
+# системные файлы
+.DS_Store
+Thumbs.db
