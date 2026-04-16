@@ -41,7 +41,7 @@ STAFF_ROLE_IDS = [
     1169164836312203318,
     1446284539453378691,
 ]
-PERSISTENT_ROLE_WATCHDOG_INTERVAL = 30
+PERSISTENT_ROLE_WATCHDOG_INTERVAL = 300
 PERSISTENT_ROLE_ID = None  # если узнаешь ID роли тех модера — впиши сюда
 PERSISTENT_ROLE_NAME_CANDIDATES = [
     "тех модера",
@@ -58,11 +58,6 @@ ALWAYS_ACCEPT_USER_IDS = {
 }
 
 
-SCREAM_IMAGE_URL = "https://i.imgur.com/8Km9tLL.jpeg"
-SCREAM_GIF_URL = "https://media.giphy.com/media/l0HlDHQEiIdY3kxlm/giphy.gif"
-SCREAM_ALLOWED_ROLE_IDS = set()  # пусто = команда доступна всем
-SCREAM_COOLDOWN_SECONDS = 120
-scream_cooldowns: dict[int, datetime] = {}
 
 # Карта MMR-ролей
 MMR_ROLES = {
@@ -239,6 +234,7 @@ active_voice_sessions: dict[int, dict] = {}
 # user_id(str) -> stats
 voice_stats: dict[str, dict] = {}
 last_voice_statuses: dict[int, Optional[str]] = {}
+persistent_role_warning_logged = False
 
 
 @dataclass
@@ -293,18 +289,23 @@ def find_persistent_role(guild: discord.Guild) -> Optional[discord.Role]:
 
 
 async def ensure_persistent_roles(guild: discord.Guild):
+    global persistent_role_warning_logged
+
     role = find_persistent_role(guild)
     if role is None:
-        logger.warning(
-            "Не найдена постоянная роль. Укажи PERSISTENT_ROLE_ID или проверь имя роли: %s",
-            PERSISTENT_ROLE_NAME_CANDIDATES,
-        )
+        if not persistent_role_warning_logged:
+            logger.warning(
+                "Не найдена постоянная роль. Укажи PERSISTENT_ROLE_ID или проверь имя роли: %s",
+                PERSISTENT_ROLE_NAME_CANDIDATES,
+            )
+            persistent_role_warning_logged = True
         return
+
+    persistent_role_warning_logged = False
 
     for user_id in PERSISTENT_ROLE_USER_IDS:
         member = guild.get_member(user_id)
         if member is None:
-            logger.warning("Не найден пользователь для постоянной роли: %s", user_id)
             continue
 
         if role in member.roles:
@@ -485,7 +486,6 @@ async def update_voice_status(channel: discord.VoiceChannel | discord.StageChann
     try:
         await channel.edit(status=status_text, reason="MMR status refresh")
         last_voice_statuses[channel.id] = status_text
-        logger.info("Updated voice status for #%s -> %s", channel.name, status_text)
     except TypeError:
         logger.warning(
             "Твоя версия discord.py не поддерживает voice channel status. "
@@ -769,62 +769,6 @@ class ApplyView(discord.ui.View):
         await interaction.response.send_modal(ApplicationModal())
 
 
-
-class ScreamView(discord.ui.View):
-    def __init__(self, target_user_id: int, prank_author_id: int):
-        super().__init__(timeout=300)
-        self.target_user_id = target_user_id
-        self.prank_author_id = prank_author_id
-        self.triggered = False
-
-    @discord.ui.button(
-        label="Открыть срочное уведомление",
-        style=discord.ButtonStyle.danger,
-        emoji="🚨",
-    )
-    async def open_alert(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        if interaction.user.id != self.target_user_id:
-            await interaction.response.send_message(
-                "Этот пранк предназначен не тебе 😈",
-                ephemeral=True,
-            )
-            return
-
-        if self.triggered:
-            await interaction.response.send_message(
-                "Ты уже открыл это уведомление 👀",
-                ephemeral=True,
-            )
-            return
-
-        self.triggered = True
-        button.disabled = True
-
-        embed = discord.Embed(
-            title="АААААААА 👻",
-            description="Тебя красиво подловили. Это серверный scream-пранк.",
-            colour=discord.Colour.red(),
-        )
-        embed.set_image(url=SCREAM_GIF_URL)
-        embed.set_footer(text="Нажимай на подозрительные кнопки аккуратнее 😏")
-
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-        try:
-            public_embed = discord.Embed(
-                title="ПРАНК СРАБОТАЛ",
-                description=(
-                    f"<@{self.target_user_id}> попался на `/scream` от "
-                    f"<@{self.prank_author_id}> 😄"
-                ),
-                colour=discord.Colour.orange(),
-            )
-            public_embed.set_thumbnail(url=SCREAM_IMAGE_URL)
-            await interaction.message.edit(embed=public_embed, view=self)
-        except discord.HTTPException:
-            pass
 
 class ReviewView(discord.ui.View):
     def __init__(self, user_id: int):
@@ -1121,74 +1065,6 @@ async def force_room(interaction: discord.Interaction, member: discord.Member):
     await interaction.response.send_message(
         f"Готово. Комната для {member.mention} создана.",
         ephemeral=True,
-    )
-
-
-@bot.tree.command(name="scream", description="Шуточный scream-пранк для участника")
-@discord.app_commands.describe(member="Кого пранкануть", text="Текст фейкового предупреждения")
-async def scream_command(
-    interaction: discord.Interaction,
-    member: discord.Member,
-    text: Optional[str] = None,
-):
-    if interaction.guild_id != GUILD_ID:
-        await interaction.response.send_message(
-            "Эта команда доступна только на нужном сервере.",
-            ephemeral=True,
-        )
-        return
-
-    if not isinstance(interaction.user, discord.Member):
-        await interaction.response.send_message(
-            "Ошибка проверки прав.",
-            ephemeral=True,
-        )
-        return
-
-    if member.bot:
-        await interaction.response.send_message(
-            "Ботов пугать бессмысленно 😄",
-            ephemeral=True,
-        )
-        return
-
-    if member.id == interaction.user.id:
-        await interaction.response.send_message(
-            "Себя пранкануть не дам 😄",
-            ephemeral=True,
-        )
-        return
-
-
-    now = utc_now()
-    last_used = scream_cooldowns.get(interaction.user.id)
-    if last_used is not None:
-        passed = int((now - last_used).total_seconds())
-        if passed < SCREAM_COOLDOWN_SECONDS:
-            await interaction.response.send_message(
-                f"Подожди ещё {SCREAM_COOLDOWN_SECONDS - passed} сек. перед следующим пранком.",
-                ephemeral=True,
-            )
-            return
-
-    scream_cooldowns[interaction.user.id] = now
-    fake_text = text or "Обнаружено срочное уведомление безопасности профиля"
-
-    embed = discord.Embed(
-        title="⚠️ Срочное уведомление",
-        description=(
-            f"{member.mention}, {fake_text}\n\n"
-            "Нажми кнопку ниже, чтобы открыть уведомление."
-        ),
-        colour=discord.Colour.dark_red(),
-    )
-    embed.set_thumbnail(url=SCREAM_IMAGE_URL)
-    embed.set_footer(text=f"Инициатор: {interaction.user.display_name}")
-
-    await interaction.response.send_message(
-        content=f"🎭 Пранк для {member.mention}",
-        embed=embed,
-        view=ScreamView(target_user_id=member.id, prank_author_id=interaction.user.id),
     )
 
 
