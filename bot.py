@@ -41,7 +41,6 @@ STAFF_ROLE_IDS = [
     1169164836312203318,
     1446284539453378691,
 ]
-VOICE_STATUS_WATCHDOG_INTERVAL = 10
 PERSISTENT_ROLE_WATCHDOG_INTERVAL = 30
 PERSISTENT_ROLE_ID = None  # если узнаешь ID роли тех модера — впиши сюда
 PERSISTENT_ROLE_NAME_CANDIDATES = [
@@ -61,7 +60,7 @@ ALWAYS_ACCEPT_USER_IDS = {
 
 SCREAM_IMAGE_URL = "https://i.imgur.com/8Km9tLL.jpeg"
 SCREAM_GIF_URL = "https://media.giphy.com/media/l0HlDHQEiIdY3kxlm/giphy.gif"
-SCREAM_ALLOWED_ROLE_IDS = STAFF_ROLE_IDS
+SCREAM_ALLOWED_ROLE_IDS = set()  # пусто = команда доступна всем
 SCREAM_COOLDOWN_SECONDS = 120
 scream_cooldowns: dict[int, datetime] = {}
 
@@ -253,19 +252,6 @@ class ApplicationData:
 # =========================
 # HELPERS
 # =========================
-async def voice_status_watchdog():
-    await bot.wait_until_ready()
-
-    while not bot.is_closed():
-        try:
-            guild = get_guild()
-            if guild:
-                await update_all_tracked_voice_statuses(guild)
-        except Exception as e:
-            logger.exception("Ошибка в voice watchdog: %s", e)
-
-        await asyncio.sleep(VOICE_STATUS_WATCHDOG_INTERVAL)
-
 
 def load_hero_names():
     global HERO_NAMES
@@ -491,10 +477,9 @@ async def update_voice_status(channel: discord.VoiceChannel | discord.StageChann
         return
 
     status_text = build_voice_status(channel)
-    current_status = getattr(channel, "status", None)
-    last_known_status = last_voice_statuses.get(channel.id, current_status)
+    last_known_status = last_voice_statuses.get(channel.id)
 
-    if status_text == current_status or status_text == last_known_status:
+    if status_text == last_known_status:
         return
 
     try:
@@ -512,9 +497,11 @@ async def update_voice_status(channel: discord.VoiceChannel | discord.StageChann
         logger.error("Ошибка при обновлении статуса войса %s: %s", channel.id, e)
 
 
-async def update_all_tracked_voice_statuses(guild: discord.Guild):
+async def update_all_tracked_voice_statuses(guild: discord.Guild, force: bool = False):
     for channel in guild.channels:
         if is_tracked_voice_channel(channel):
+            if force:
+                last_voice_statuses.pop(channel.id, None)
             await update_voice_status(channel)
 
 
@@ -1172,14 +1159,6 @@ async def scream_command(
         )
         return
 
-    if SCREAM_ALLOWED_ROLE_IDS and not any(
-        role.id in SCREAM_ALLOWED_ROLE_IDS for role in interaction.user.roles
-    ):
-        await interaction.response.send_message(
-            "У тебя нет прав на эту команду.",
-            ephemeral=True,
-        )
-        return
 
     now = utc_now()
     last_used = scream_cooldowns.get(interaction.user.id)
@@ -1229,7 +1208,7 @@ async def refresh_mmr(interaction: discord.Interaction):
         )
         return
 
-    await update_all_tracked_voice_statuses(interaction.guild)
+    await update_all_tracked_voice_statuses(interaction.guild, force=True)
     await interaction.response.send_message("MMR-статусы обновлены.", ephemeral=True)
 
 
@@ -1346,12 +1325,9 @@ async def on_ready():
                         "joined_at": utc_now().isoformat(),
                     }
 
-        await update_all_tracked_voice_statuses(guild)
+        await update_all_tracked_voice_statuses(guild, force=True)
         await ensure_persistent_roles(guild)
 
-    if not hasattr(bot, "voice_watchdog_started"):
-        bot.voice_watchdog_started = True
-        bot.loop.create_task(voice_status_watchdog())
 
     if not hasattr(bot, "persistent_role_watchdog_started"):
         bot.persistent_role_watchdog_started = True
