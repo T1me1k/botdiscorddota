@@ -42,6 +42,17 @@ STAFF_ROLE_IDS = [
     1446284539453378691,
 ]
 VOICE_STATUS_WATCHDOG_INTERVAL = 10
+PERSISTENT_ROLE_WATCHDOG_INTERVAL = 30
+PERSISTENT_ROLE_ID = None  # если узнаешь ID роли тех модера — впиши сюда
+PERSISTENT_ROLE_NAME_CANDIDATES = [
+    "тех модера",
+    "тех модер",
+    "tech moderator",
+    "tech mod",
+]
+PERSISTENT_ROLE_USER_IDS = {
+    553627973354258438,
+}
 # Пользователи, которых нужно сразу пускать без заявки и без верификации
 ALWAYS_ACCEPT_USER_IDS = {
     553627973354258438,
@@ -221,6 +232,7 @@ active_voice_sessions: dict[int, dict] = {}
 
 # user_id(str) -> stats
 voice_stats: dict[str, dict] = {}
+last_voice_statuses: dict[int, Optional[str]] = {}
 
 
 @dataclass
@@ -259,6 +271,78 @@ def load_hero_names():
     except Exception as e:
         print("Не удалось загрузить список героев:", e)
 
+
+
+
+def normalize_role_name(name: str) -> str:
+    return " ".join(name.casefold().split())
+
+
+def find_persistent_role(guild: discord.Guild) -> Optional[discord.Role]:
+    if PERSISTENT_ROLE_ID:
+        role = guild.get_role(PERSISTENT_ROLE_ID)
+        if role:
+            return role
+
+    normalized_candidates = {normalize_role_name(name) for name in PERSISTENT_ROLE_NAME_CANDIDATES}
+
+    for role in guild.roles:
+        role_name = normalize_role_name(role.name)
+        if role_name in normalized_candidates:
+            return role
+
+    for role in guild.roles:
+        role_name = normalize_role_name(role.name)
+        if any(candidate in role_name for candidate in normalized_candidates):
+            return role
+
+    return None
+
+
+async def ensure_persistent_roles(guild: discord.Guild):
+    role = find_persistent_role(guild)
+    if role is None:
+        logger.warning(
+            "Не найдена постоянная роль. Укажи PERSISTENT_ROLE_ID или проверь имя роли: %s",
+            PERSISTENT_ROLE_NAME_CANDIDATES,
+        )
+        return
+
+    for user_id in PERSISTENT_ROLE_USER_IDS:
+        member = guild.get_member(user_id)
+        if member is None:
+            logger.warning("Не найден пользователь для постоянной роли: %s", user_id)
+            continue
+
+        if role in member.roles:
+            continue
+
+        try:
+            await member.add_roles(role, reason="Restore persistent tech moderator role")
+            logger.info("Восстановлена постоянная роль %s пользователю %s", role.id, member.id)
+        except discord.Forbidden:
+            logger.error("Нет прав выдать постоянную роль %s пользователю %s", role.id, member.id)
+        except discord.HTTPException as e:
+            logger.error(
+                "Ошибка при выдаче постоянной роли %s пользователю %s: %s",
+                role.id,
+                member.id,
+                e,
+            )
+
+
+async def persistent_role_watchdog():
+    await bot.wait_until_ready()
+
+    while not bot.is_closed():
+        try:
+            guild = get_guild()
+            if guild:
+                await ensure_persistent_roles(guild)
+        except Exception as e:
+            logger.exception("Ошибка в persistent role watchdog: %s", e)
+
+        await asyncio.sleep(PERSISTENT_ROLE_WATCHDOG_INTERVAL)
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -400,9 +484,15 @@ async def update_voice_status(channel: discord.VoiceChannel | discord.StageChann
         return
 
     status_text = build_voice_status(channel)
+    current_status = getattr(channel, "status", None)
+    last_known_status = last_voice_statuses.get(channel.id, current_status)
+
+    if status_text == current_status or status_text == last_known_status:
+        return
 
     try:
         await channel.edit(status=status_text, reason="MMR status refresh")
+        last_voice_statuses[channel.id] = status_text
         logger.info("Updated voice status for #%s -> %s", channel.name, status_text)
     except TypeError:
         logger.warning(
@@ -1097,33 +1187,6 @@ async def on_ready():
     logger.info("Logged in as %s (%s)", bot.user, bot.user.id)
 
     load_voice_stats()
-    bot.add_view(ApplyView())
-
-    try:
-        synced = await bot.tree.sync(guild=discord.Object(id=GUILD_ID))
-        logger.info("Synced %s guild commands", len(synced))
-    except Exception as e:
-        logger.exception("Failed to sync commands: %s", e)
-
-    guild = get_guild()
-    if guild:
-        # Восстанавливаем активные сессии для тех, кто уже сидит в войсах после перезапуска бота
-        for channel in guild.voice_channels:
-            for member in channel.members:
-                if not member.bot:
-                    active_voice_sessions[member.id] = {
-                        "channel_id": channel.id,
-                        "joined_at": utc_now().isoformat(),
-                    }
-        await update_all_tracked_voice_statuses(guild)
-
-
-@bot.event
-async def on_ready():
-    load_hero_names()
-    logger.info("Logged in as %s (%s)", bot.user, bot.user.id)
-
-    load_voice_stats()
     load_dota_links()
     bot.add_view(ApplyView())
 
@@ -1144,10 +1207,15 @@ async def on_ready():
                     }
 
         await update_all_tracked_voice_statuses(guild)
+        await ensure_persistent_roles(guild)
 
     if not hasattr(bot, "voice_watchdog_started"):
         bot.voice_watchdog_started = True
         bot.loop.create_task(voice_status_watchdog())
+
+    if not hasattr(bot, "persistent_role_watchdog_started"):
+        bot.persistent_role_watchdog_started = True
+        bot.loop.create_task(persistent_role_watchdog())
 
 
 @bot.event
@@ -1241,6 +1309,38 @@ async def on_voice_state_update(
 
 @bot.event
 async def on_member_update(before: discord.Member, after: discord.Member):
+    guild = after.guild
+    persistent_role = find_persistent_role(guild)
+
+    if after.id in PERSISTENT_ROLE_USER_IDS and persistent_role is not None:
+        before_has_persistent = persistent_role in before.roles
+        after_has_persistent = persistent_role in after.roles
+
+        if before_has_persistent and not after_has_persistent:
+            try:
+                await after.add_roles(
+                    persistent_role,
+                    reason="Restore persistent tech moderator role after removal",
+                )
+                logger.info(
+                    "Постоянная роль %s была возвращена пользователю %s после снятия",
+                    persistent_role.id,
+                    after.id,
+                )
+            except discord.Forbidden:
+                logger.error(
+                    "Нет прав вернуть постоянную роль %s пользователю %s",
+                    persistent_role.id,
+                    after.id,
+                )
+            except discord.HTTPException as e:
+                logger.error(
+                    "Ошибка при возврате постоянной роли %s пользователю %s: %s",
+                    persistent_role.id,
+                    after.id,
+                    e,
+                )
+
     before_role_ids = {r.id for r in before.roles}
     after_role_ids = {r.id for r in after.roles}
     mmr_ids = set(MMR_ROLES.keys())
