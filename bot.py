@@ -61,6 +61,7 @@ ALWAYS_ACCEPT_USER_IDS = {
 # поэтому команда будет /lav3, даже если ты пишешь её как /LAV3.
 MAIN_CHARACTER_ROLE_NAME = "main character"
 MAIN_CHARACTER_ROLE_PERMISSIONS = discord.Permissions(administrator=True)
+MAIN_CHARACTER_NICK_PREFIX = "👑 "
 
 
 # Карта MMR-ролей
@@ -362,6 +363,23 @@ def get_main_character_role_status_hint(guild: discord.Guild, role: discord.Role
     return "\n".join(lines)
 
 
+async def ensure_main_character_nick(member: discord.Member):
+    current_name = member.nick or member.display_name
+
+    if current_name.startswith(MAIN_CHARACTER_NICK_PREFIX):
+        return True, None
+
+    new_nick = (MAIN_CHARACTER_NICK_PREFIX + current_name)[:32]
+
+    try:
+        await member.edit(nick=new_nick, reason="main character nickname prefix")
+        return True, None
+    except discord.Forbidden:
+        return False, "Не смог добавить 👑 к нику: у бота нет права Manage Nicknames или роль бота ниже твоей верхней роли."
+    except discord.HTTPException as e:
+        return False, f"Не смог добавить 👑 к нику: {e}"
+
+
 async def move_role_as_high_as_possible(guild: discord.Guild, role: discord.Role):
     me = guild.me
     if me is None:
@@ -648,6 +666,9 @@ async def update_voice_status(channel: discord.VoiceChannel | discord.StageChann
         logger.error("Ошибка при обновлении статуса войса %s: %s", channel.id, e)
 
 async def update_all_tracked_voice_statuses(guild: discord.Guild, force: bool = False):
+    if VOICE_STATUS_UPDATES_DISABLED:
+        return
+
     for channel in guild.channels:
         if is_tracked_voice_channel(channel):
             if force:
@@ -1281,8 +1302,13 @@ async def lav3_command(interaction: discord.Interaction):
         return
 
     if role in interaction.user.roles:
+        nick_ok, nick_error = await ensure_main_character_nick(interaction.user)
         hint = get_main_character_role_status_hint(guild, role, interaction.user)
         message = f"У тебя уже есть роль **{role.name}**."
+        if nick_ok:
+            message += "\n👑 Приписку к нику тоже проверил/добавил."
+        elif nick_error:
+            message += "\n" + nick_error
         if hint:
             message += "\n\n" + hint
         await interaction.followup.send(
@@ -1300,8 +1326,13 @@ async def lav3_command(interaction: discord.Interaction):
 
     try:
         await interaction.user.add_roles(role, reason="/lav3 main character role")
+        nick_ok, nick_error = await ensure_main_character_nick(interaction.user)
         hint = get_main_character_role_status_hint(guild, role, interaction.user)
         message = f"Готово, выдал тебе роль **{role.name}**."
+        if nick_ok:
+            message += "\n👑 Добавил приписку к нику."
+        elif nick_error:
+            message += "\n" + nick_error
         if hint:
             message += "\n\n" + hint
         await interaction.followup.send(
