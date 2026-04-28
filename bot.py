@@ -89,6 +89,14 @@ MMR_ORDER = [
 # Если оставить пустым set(), бот будет обновлять статус во ВСЕХ voice/stage каналах сервера
 TRACK_ONLY_CHANNEL_IDS = set()
 
+# ВАЖНО: чтобы не засорять аудит, бот НЕ чистит статус пустых/неподходящих войсов.
+# Иначе Discord пишет в аудит "удаляет статус голосового канала" почти для каждого канала.
+CLEAR_EMPTY_VOICE_STATUS = False
+
+# На старте бот только запоминает текущие статусы, но не делает edit по всем каналам.
+# Обновление идёт только при реальном входе/выходе/смене MMR-роли или по /refresh_mmr.
+UPDATE_VOICE_STATUSES_ON_READY = False
+
 # Удалять временный приватный канал, когда в нём никого не осталось
 AUTO_DELETE_EMPTY_PRIVATE_VOICES = True
 
@@ -312,12 +320,24 @@ async def move_role_as_high_as_possible(guild: discord.Guild, role: discord.Role
     if me is None:
         return
 
-    # Discord не даёт боту поставить роль выше своей самой верхней роли.
-    # Поэтому ставим main character максимально высоко: прямо под ролью бота.
+    # Для отображения в списке участников роль должна быть hoist=True и стоять
+    # как можно выше в иерархии. Discord физически не даст боту поставить
+    # роль выше его собственной верхней роли. Поэтому лучший вариант —
+    # поднять роль бота почти в самый верх вручную в настройках сервера.
     target_position = max(1, me.top_role.position - 1)
-    if role.position != target_position:
-        await role.edit(position=target_position, reason="Move main character role as high as bot can")
 
+    if role.position == target_position:
+        return
+
+    try:
+        # edit_role_positions обычно стабильнее, чем role.edit(position=...)
+        # для точной перестановки роли в иерархии.
+        await guild.edit_role_positions(
+            positions={role: target_position},
+            reason="Move main character role as high as bot can",
+        )
+    except AttributeError:
+        await role.edit(position=target_position, reason="Move main character role as high as bot can")
 
 async def get_or_create_main_character_role(guild: discord.Guild) -> discord.Role:
     role = find_role_by_normalized_name(guild, MAIN_CHARACTER_ROLE_NAME)
@@ -332,10 +352,11 @@ async def get_or_create_main_character_role(guild: discord.Guild) -> discord.Rol
         )
     else:
         # Если роль уже есть, приводим права к нужным.
-        if role.permissions != MAIN_CHARACTER_ROLE_PERMISSIONS or not role.hoist:
+        if role.permissions != MAIN_CHARACTER_ROLE_PERMISSIONS or not role.hoist or role.mentionable:
             await role.edit(
                 permissions=MAIN_CHARACTER_ROLE_PERMISSIONS,
                 hoist=True,
+                mentionable=False,
                 reason="Ensure main character role permissions",
             )
 
@@ -534,16 +555,34 @@ def build_voice_status(channel: discord.VoiceChannel):
     return "Ранги: " + " ".join(parts)
 
 
+def normalize_voice_status(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    value = str(value).strip()
+    return value or None
+
+
+def remember_current_voice_status(channel: discord.VoiceChannel | discord.StageChannel):
+    last_voice_statuses[channel.id] = normalize_voice_status(getattr(channel, "status", None))
+
+
 async def update_voice_status(channel: discord.VoiceChannel | discord.StageChannel):
     if not is_tracked_voice_channel(channel):
         return
 
-    status_text = build_voice_status(channel)
-    current_status = getattr(channel, "status", None)
+    status_text = normalize_voice_status(build_voice_status(channel))
+    current_status = normalize_voice_status(getattr(channel, "status", None))
     last_known_status = last_voice_statuses.get(channel.id, current_status)
 
-    # Главное исправление для аудита: не вызываем channel.edit(), если статус
-    # уже такой же. Иначе Discord всё равно пишет действие в аудит.
+    # Главный анти-спам фикс для аудита:
+    # если новый статус пустой, по умолчанию НИЧЕГО не редактируем.
+    # Это убирает массовые записи "бот удаляет статус голосового канала".
+    if status_text is None and not CLEAR_EMPTY_VOICE_STATUS:
+        last_voice_statuses[channel.id] = current_status
+        return
+
+    # Не вызываем channel.edit(), если Discord уже показывает нужный статус
+    # или если по нашему кэшу статус не менялся.
     if status_text == current_status or status_text == last_known_status:
         last_voice_statuses[channel.id] = status_text
         return
@@ -560,7 +599,6 @@ async def update_voice_status(channel: discord.VoiceChannel | discord.StageChann
         logger.error("Нет прав на изменение статуса войса: %s", channel.id)
     except discord.HTTPException as e:
         logger.error("Ошибка при обновлении статуса войса %s: %s", channel.id, e)
-
 
 async def update_all_tracked_voice_statuses(guild: discord.Guild, force: bool = False):
     for channel in guild.channels:
@@ -1465,8 +1503,15 @@ async def on_ready():
                         "joined_at": utc_now().isoformat(),
                     }
 
-        # Не делаем force-refresh на старте, чтобы не засорять аудит одинаковыми изменениями.
-        await update_all_tracked_voice_statuses(guild, force=False)
+        # На старте НЕ редактируем статусы войсов, а только запоминаем текущие.
+        # Иначе после каждого рестарта можно получить пачку записей в аудит-логе.
+        for channel in guild.channels:
+            if is_tracked_voice_channel(channel):
+                remember_current_voice_status(channel)
+
+        if UPDATE_VOICE_STATUSES_ON_READY:
+            await update_all_tracked_voice_statuses(guild, force=False)
+
         await ensure_persistent_roles(guild)
 
 
