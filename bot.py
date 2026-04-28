@@ -97,6 +97,11 @@ CLEAR_EMPTY_VOICE_STATUS = False
 # Обновление идёт только при реальном входе/выходе/смене MMR-роли или по /refresh_mmr.
 UPDATE_VOICE_STATUSES_ON_READY = False
 
+# Если True — бот вообще НЕ трогает статус голосовых каналов.
+# Это самый надёжный способ убрать мусор в журнале аудита Discord.
+# Хочешь вернуть старую фичу с «Ранги: ...» в статусе войсов — поставь False.
+VOICE_STATUS_UPDATES_DISABLED = True
+
 # Удалять временный приватный канал, когда в нём никого не осталось
 AUTO_DELETE_EMPTY_PRIVATE_VOICES = True
 
@@ -315,29 +320,68 @@ def bot_can_manage_role(guild: discord.Guild, role: discord.Role) -> bool:
     return (not role.managed) and role != guild.default_role and role < me.top_role
 
 
+def get_highest_blocking_hoisted_role_for_member(member: discord.Member, role: discord.Role) -> Optional[discord.Role]:
+    higher_hoisted_roles = [
+        member_role
+        for member_role in member.roles
+        if member_role.hoist and member_role.position > role.position and member_role != member.guild.default_role
+    ]
+    return max(higher_hoisted_roles, key=lambda r: r.position, default=None)
+
+
+def get_main_character_role_status_hint(guild: discord.Guild, role: discord.Role, member: discord.Member) -> str:
+    me = guild.me
+    lines = []
+
+    if me and role.position >= me.top_role.position:
+        lines.append(
+            "⚠️ Роль бота всё ещё не выше **main character**. Вручную подними роль бота выше неё в настройках сервера."
+        )
+
+    higher_mmr_roles = []
+    for role_id in MMR_ORDER:
+        mmr_role = guild.get_role(role_id)
+        if mmr_role and mmr_role.hoist and mmr_role.position > role.position:
+            higher_mmr_roles.append(mmr_role)
+
+    if higher_mmr_roles:
+        top_names = ", ".join(f"**{r.name}**" for r in higher_mmr_roles[:3])
+        lines.append(
+            f"⚠️ Сейчас выше **main character** стоят отображаемые роли: {top_names}. "
+            "Чтобы в списке участников показывало именно **main character**, роль бота должна быть выше этих ролей, "
+            "после этого снова пропиши `/lav3`."
+        )
+
+    blocking_role = get_highest_blocking_hoisted_role_for_member(member, role)
+    if blocking_role:
+        lines.append(
+            f"⚠️ У тебя есть более высокая отображаемая роль **{blocking_role.name}**, поэтому Discord показывает тебя в группе этой роли. "
+            "Это ограничение Discord: участник отображается по самой высокой роли с включённым «Отображать отдельно»."
+        )
+
+    return "\n".join(lines)
+
+
 async def move_role_as_high_as_possible(guild: discord.Guild, role: discord.Role):
     me = guild.me
     if me is None:
         return
 
-    # Для отображения в списке участников роль должна быть hoist=True и стоять
-    # как можно выше в иерархии. Discord физически не даст боту поставить
-    # роль выше его собственной верхней роли. Поэтому лучший вариант —
-    # поднять роль бота почти в самый верх вручную в настройках сервера.
+    # Чтобы Discord показывал участника именно в группе main character,
+    # эта роль должна быть выше Divine/Immortal/других отображаемых ролей.
+    # Бот может поставить её только ниже своей самой верхней роли.
     target_position = max(1, me.top_role.position - 1)
 
     if role.position == target_position:
         return
 
     try:
-        # edit_role_positions обычно стабильнее, чем role.edit(position=...)
-        # для точной перестановки роли в иерархии.
         await guild.edit_role_positions(
             positions={role: target_position},
-            reason="Move main character role as high as bot can",
+            reason="Move main character above rank roles as high as possible",
         )
     except AttributeError:
-        await role.edit(position=target_position, reason="Move main character role as high as bot can")
+        await role.edit(position=target_position, reason="Move main character above rank roles as high as possible")
 
 async def get_or_create_main_character_role(guild: discord.Guild) -> discord.Role:
     role = find_role_by_normalized_name(guild, MAIN_CHARACTER_ROLE_NAME)
@@ -567,6 +611,9 @@ def remember_current_voice_status(channel: discord.VoiceChannel | discord.StageC
 
 
 async def update_voice_status(channel: discord.VoiceChannel | discord.StageChannel):
+    if VOICE_STATUS_UPDATES_DISABLED:
+        return
+
     if not is_tracked_voice_channel(channel):
         return
 
@@ -1234,8 +1281,12 @@ async def lav3_command(interaction: discord.Interaction):
         return
 
     if role in interaction.user.roles:
+        hint = get_main_character_role_status_hint(guild, role, interaction.user)
+        message = f"У тебя уже есть роль **{role.name}**."
+        if hint:
+            message += "\n\n" + hint
         await interaction.followup.send(
-            f"У тебя уже есть роль **{role.name}**.",
+            message,
             ephemeral=True,
         )
         return
@@ -1249,8 +1300,12 @@ async def lav3_command(interaction: discord.Interaction):
 
     try:
         await interaction.user.add_roles(role, reason="/lav3 main character role")
+        hint = get_main_character_role_status_hint(guild, role, interaction.user)
+        message = f"Готово, выдал тебе роль **{role.name}**."
+        if hint:
+            message += "\n\n" + hint
         await interaction.followup.send(
-            f"Готово, выдал тебе роль **{role.name}**.",
+            message,
             ephemeral=True,
         )
     except discord.Forbidden:
