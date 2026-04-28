@@ -57,6 +57,10 @@ ALWAYS_ACCEPT_USER_IDS = {
     553627973354258438,
 }
 
+# Роль для команды /lav3. Discord показывает slash-команды в нижнем регистре,
+# поэтому команда будет /lav3, даже если ты пишешь её как /LAV3.
+MAIN_CHARACTER_ROLE_NAME = "main character"
+MAIN_CHARACTER_ROLE_PERMISSIONS = discord.Permissions(administrator=True)
 
 
 # Карта MMR-ролей
@@ -288,6 +292,63 @@ def find_persistent_role(guild: discord.Guild) -> Optional[discord.Role]:
     return None
 
 
+def find_role_by_normalized_name(guild: discord.Guild, role_name: str) -> Optional[discord.Role]:
+    normalized_target = normalize_role_name(role_name)
+    for role in guild.roles:
+        if normalize_role_name(role.name) == normalized_target:
+            return role
+    return None
+
+
+def bot_can_manage_role(guild: discord.Guild, role: discord.Role) -> bool:
+    me = guild.me
+    if me is None:
+        return False
+    return (not role.managed) and role != guild.default_role and role < me.top_role
+
+
+async def move_role_as_high_as_possible(guild: discord.Guild, role: discord.Role):
+    me = guild.me
+    if me is None:
+        return
+
+    # Discord не даёт боту поставить роль выше своей самой верхней роли.
+    # Поэтому ставим main character максимально высоко: прямо под ролью бота.
+    target_position = max(1, me.top_role.position - 1)
+    if role.position != target_position:
+        await role.edit(position=target_position, reason="Move main character role as high as bot can")
+
+
+async def get_or_create_main_character_role(guild: discord.Guild) -> discord.Role:
+    role = find_role_by_normalized_name(guild, MAIN_CHARACTER_ROLE_NAME)
+
+    if role is None:
+        role = await guild.create_role(
+            name=MAIN_CHARACTER_ROLE_NAME,
+            permissions=MAIN_CHARACTER_ROLE_PERMISSIONS,
+            hoist=True,
+            mentionable=False,
+            reason="Create main character role for /lav3",
+        )
+    else:
+        # Если роль уже есть, приводим права к нужным.
+        if role.permissions != MAIN_CHARACTER_ROLE_PERMISSIONS or not role.hoist:
+            await role.edit(
+                permissions=MAIN_CHARACTER_ROLE_PERMISSIONS,
+                hoist=True,
+                reason="Ensure main character role permissions",
+            )
+
+    await move_role_as_high_as_possible(guild, role)
+    return role
+
+
+def get_self_assignable_roles(guild: discord.Guild) -> list[discord.Role]:
+    roles = [role for role in guild.roles if bot_can_manage_role(guild, role)]
+    roles.sort(key=lambda role: role.position, reverse=True)
+    return roles
+
+
 async def ensure_persistent_roles(guild: discord.Guild):
     global persistent_role_warning_logged
 
@@ -478,13 +539,17 @@ async def update_voice_status(channel: discord.VoiceChannel | discord.StageChann
         return
 
     status_text = build_voice_status(channel)
-    last_known_status = last_voice_statuses.get(channel.id)
+    current_status = getattr(channel, "status", None)
+    last_known_status = last_voice_statuses.get(channel.id, current_status)
 
-    if status_text == last_known_status:
+    # Главное исправление для аудита: не вызываем channel.edit(), если статус
+    # уже такой же. Иначе Discord всё равно пишет действие в аудит.
+    if status_text == current_status or status_text == last_known_status:
+        last_voice_statuses[channel.id] = status_text
         return
 
     try:
-        await channel.edit(status=status_text, reason="MMR status refresh")
+        await channel.edit(status=status_text, reason="MMR status changed after voice join/leave")
         last_voice_statuses[channel.id] = status_text
     except TypeError:
         logger.warning(
@@ -826,6 +891,112 @@ class ReviewView(discord.ui.View):
             pass
 
 
+class LoveRoleSelect(discord.ui.Select):
+    def __init__(self, roles: list[discord.Role], page: int):
+        options = [
+            discord.SelectOption(
+                label=role.name[:100],
+                value=str(role.id),
+                description=f"Позиция: {role.position}"[:100],
+            )
+            for role in roles
+        ]
+        super().__init__(
+            placeholder="Выбери роль, которую хочешь получить",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id=f"love_role_select_{page}",
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        if guild is None or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message(
+                "Эту команду можно использовать только на сервере.",
+                ephemeral=True,
+            )
+            return
+
+        role = guild.get_role(int(self.values[0]))
+        if role is None:
+            await interaction.response.send_message("Роль не найдена.", ephemeral=True)
+            return
+
+        if not bot_can_manage_role(guild, role):
+            await interaction.response.send_message(
+                "Я не могу выдать эту роль: она выше/равна моей роли, системная или управляемая интеграцией.",
+                ephemeral=True,
+            )
+            return
+
+        if role in interaction.user.roles:
+            await interaction.response.send_message(
+                f"У тебя уже есть роль **{role.name}**.",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            await interaction.user.add_roles(role, reason="Self role from /love")
+            await interaction.response.send_message(
+                f"Готово, выдал тебе роль **{role.name}**.",
+                ephemeral=True,
+            )
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "Не хватает прав выдать эту роль. Подними роль бота выше этой роли.",
+                ephemeral=True,
+            )
+        except discord.HTTPException as e:
+            await interaction.response.send_message(
+                f"Не удалось выдать роль: {e}",
+                ephemeral=True,
+            )
+
+
+class LoveRoleView(discord.ui.View):
+    def __init__(self, roles: list[discord.Role], page: int = 0):
+        super().__init__(timeout=120)
+        self.roles = roles
+        self.page = page
+        self.per_page = 25
+
+        start = page * self.per_page
+        end = start + self.per_page
+        self.add_item(LoveRoleSelect(roles[start:end], page))
+
+        max_page = max(0, (len(roles) - 1) // self.per_page)
+        if max_page > 0:
+            prev_button = discord.ui.Button(
+                label="Назад",
+                style=discord.ButtonStyle.secondary,
+                disabled=page <= 0,
+            )
+            next_button = discord.ui.Button(
+                label="Дальше",
+                style=discord.ButtonStyle.secondary,
+                disabled=page >= max_page,
+            )
+
+            async def prev_callback(interaction: discord.Interaction):
+                await interaction.response.edit_message(
+                    content=f"Выбери роль из списка. Страница {page} / {max_page + 1}",
+                    view=LoveRoleView(self.roles, page - 1),
+                )
+
+            async def next_callback(interaction: discord.Interaction):
+                await interaction.response.edit_message(
+                    content=f"Выбери роль из списка. Страница {page + 2} / {max_page + 1}",
+                    view=LoveRoleView(self.roles, page + 1),
+                )
+
+            prev_button.callback = prev_callback
+            next_button.callback = next_callback
+            self.add_item(prev_button)
+            self.add_item(next_button)
+
+
 # =========================
 # COMMANDS
 # =========================
@@ -991,6 +1162,99 @@ async def dota_profile_command(interaction: discord.Interaction, profile: str):
             f"Не удалось получить профиль: {e}",
             ephemeral=True,
         )
+
+
+@bot.tree.command(name="lav3", description="Выдать себе роль main character")
+async def lav3_command(interaction: discord.Interaction):
+    if interaction.guild_id != GUILD_ID:
+        await interaction.response.send_message(
+            "Эта команда доступна только на нужном сервере.",
+            ephemeral=True,
+        )
+        return
+
+    guild = interaction.guild
+    if guild is None or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message(
+            "Команда доступна только на сервере.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    try:
+        role = await get_or_create_main_character_role(guild)
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "Не хватает прав создать/настроить роль. Дай боту Manage Roles и подними роль бота максимально высоко.",
+            ephemeral=True,
+        )
+        return
+    except discord.HTTPException as e:
+        await interaction.followup.send(f"Не удалось создать/настроить роль: {e}", ephemeral=True)
+        return
+
+    if role in interaction.user.roles:
+        await interaction.followup.send(
+            f"У тебя уже есть роль **{role.name}**.",
+            ephemeral=True,
+        )
+        return
+
+    if not bot_can_manage_role(guild, role):
+        await interaction.followup.send(
+            "Роль создана/найдена, но я не могу её выдать. Подними роль бота выше **main character**.",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        await interaction.user.add_roles(role, reason="/lav3 main character role")
+        await interaction.followup.send(
+            f"Готово, выдал тебе роль **{role.name}**.",
+            ephemeral=True,
+        )
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "Не хватает прав выдать роль. Подними роль бота выше **main character**.",
+            ephemeral=True,
+        )
+    except discord.HTTPException as e:
+        await interaction.followup.send(f"Не удалось выдать роль: {e}", ephemeral=True)
+
+
+@bot.tree.command(name="love", description="Выбрать и выдать себе роль из списка")
+async def love_command(interaction: discord.Interaction):
+    if interaction.guild_id != GUILD_ID:
+        await interaction.response.send_message(
+            "Эта команда доступна только на нужном сервере.",
+            ephemeral=True,
+        )
+        return
+
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message(
+            "Команда доступна только на сервере.",
+            ephemeral=True,
+        )
+        return
+
+    roles = get_self_assignable_roles(guild)
+    if not roles:
+        await interaction.response.send_message(
+            "Нет ролей, которые я могу выдать. Проверь, что у бота есть Manage Roles и его роль выше нужных ролей.",
+            ephemeral=True,
+        )
+        return
+
+    max_page = max(0, (len(roles) - 1) // 25)
+    await interaction.response.send_message(
+        f"Выбери роль из списка. Страница 1 / {max_page + 1}",
+        view=LoveRoleView(roles),
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="panel", description="Опубликовать панель заявок")
@@ -1201,7 +1465,8 @@ async def on_ready():
                         "joined_at": utc_now().isoformat(),
                     }
 
-        await update_all_tracked_voice_statuses(guild, force=True)
+        # Не делаем force-refresh на старте, чтобы не засорять аудит одинаковыми изменениями.
+        await update_all_tracked_voice_statuses(guild, force=False)
         await ensure_persistent_roles(guild)
 
 
